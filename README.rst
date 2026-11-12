@@ -80,6 +80,27 @@ execution thread, and provide context managers to handle automatically closing
 connections.  Cursors are similarly proxies to the real cursors, and provide
 async iterators to query results.
 
+Multiple event loops
+~~~~~~~~~~~~~~~~~~~~
+
+A connection may be shared by more than one event loop, for example when
+loops running in separate threads each submit queries to the same database.
+The single worker thread and its request queue still serialize every
+operation, and each result is delivered back to the loop that submitted its
+operation.
+
+The supported boundary is that every queued operation runs at most once and
+in queue order, even when its submitting loop is closed before the result can
+be delivered.  In that case the unreachable result (or error) is discarded with
+a warning and the worker thread keeps running, so operations submitted from
+other loops still complete and the connection can still be closed or stopped.
+Closing an event loop never removes operations already queued, and a future
+bound to a closed loop can never be awaited to completion; managing the life
+cycle of each loop remains the caller's responsibility.  Prefer
+``await connection.close()`` from a still-running loop, or the synchronous
+``connection.stop()``, to release the worker thread and the underlying SQLite
+connection deterministically.
+
 
 License
 -------

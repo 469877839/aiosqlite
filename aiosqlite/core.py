@@ -41,6 +41,34 @@ def set_exception(fut: asyncio.Future, e: BaseException) -> None:
         fut.set_exception(e)
 
 
+def _resolve_future(
+    fut: asyncio.Future, setter: Callable[..., None], value: Any
+) -> bool:
+    """
+    Deliver a result or exception to a queued future from the worker thread.
+
+    Returns True if the future's event loop accepted the callback. A False
+    result means the loop that submitted the operation was closed before the
+    operation finished: the future is unreachable, so only this future is
+    abandoned while the rest of the queue keeps being processed.
+    """
+    if fut.done():
+        # The future was cancelled (or otherwise resolved) while the operation
+        # was still running; the operation's outcome has nowhere to go.
+        return True
+
+    try:
+        fut.get_loop().call_soon_threadsafe(setter, fut, value)
+        return True
+    except RuntimeError:
+        LOG.warning(
+            "discarding result for operation on %r: its event loop "
+            "was closed before the operation completed",
+            fut,
+        )
+        return False
+
+
 _STOP_RUNNING_SENTINEL = object()
 _TxQueue = SimpleQueue[tuple[Optional[asyncio.Future], Callable[[], Any]]]
 
@@ -63,7 +91,7 @@ def _connection_worker_thread(tx: _TxQueue):
             result = function()
 
             if future:
-                future.get_loop().call_soon_threadsafe(set_result, future, result)
+                _resolve_future(future, set_result, result)
             LOG.debug("operation %s completed", function)
 
             if result is _STOP_RUNNING_SENTINEL:
@@ -72,7 +100,7 @@ def _connection_worker_thread(tx: _TxQueue):
         except BaseException as e:  # noqa B036
             LOG.debug("returning exception %s", e)
             if future:
-                future.get_loop().call_soon_threadsafe(set_exception, future, e)
+                _resolve_future(future, set_exception, e)
 
 
 class Connection:
