@@ -80,6 +80,14 @@ execution thread, and provide context managers to handle automatically closing
 connections.  Cursors are similarly proxies to the real cursors, and provide
 async iterators to query results.
 
+By default, the shared request queue is unbounded. Pass ``queue_size`` to
+``aiosqlite.connect`` to cap how many operations may be queued or executing at
+once; once the limit is reached, producers wait asynchronously (backpressure)
+instead of growing the queue without bound. The limit counts the operation
+currently executing on the worker thread together with the operations still
+waiting in the queue. ``close()`` and ``stop()`` always bypass the limit, so a
+full queue never blocks shutdown.
+
 
 License
 -------

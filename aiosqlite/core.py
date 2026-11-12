@@ -8,11 +8,12 @@ Core implementation of aiosqlite proxies
 import asyncio
 import logging
 import sqlite3
+from collections import deque
 from collections.abc import AsyncIterator, Generator, Iterable
 from functools import partial
 from pathlib import Path
 from queue import Empty, Queue, SimpleQueue
-from threading import Thread
+from threading import Lock, Thread
 from typing import Any, Callable, Literal, Optional, Union
 from warnings import warn
 
@@ -42,7 +43,10 @@ def set_exception(fut: asyncio.Future, e: BaseException) -> None:
 
 
 _STOP_RUNNING_SENTINEL = object()
-_TxQueue = SimpleQueue[tuple[Optional[asyncio.Future], Callable[[], Any]]]
+_TxItem = tuple[
+    Optional[asyncio.Future], Callable[[], Any], Optional[Callable[[], None]]
+]
+_TxQueue = SimpleQueue[_TxItem]
 
 
 def _connection_worker_thread(tx: _TxQueue):
@@ -56,12 +60,29 @@ def _connection_worker_thread(tx: _TxQueue):
         # even after connection is closed (so we can finalize all
         # futures)
 
-        future, function = tx.get()
+        future, function, release_slot = tx.get()
 
         try:
+            if future is not None and future.cancelled():
+                # The async caller went away while this operation was still
+                # waiting in the queue; don't run it, just return its slot.
+                continue
+
             LOG.debug("executing %s", function)
             result = function()
 
+        except BaseException as e:  # noqa B036
+            if release_slot is not None:
+                release_slot()
+                release_slot = None
+            LOG.debug("returning exception %s", e)
+            if future:
+                future.get_loop().call_soon_threadsafe(set_exception, future, e)
+
+        else:
+            if release_slot is not None:
+                release_slot()
+                release_slot = None
             if future:
                 future.get_loop().call_soon_threadsafe(set_result, future, result)
             LOG.debug("operation %s completed", function)
@@ -69,10 +90,11 @@ def _connection_worker_thread(tx: _TxQueue):
             if result is _STOP_RUNNING_SENTINEL:
                 break
 
-        except BaseException as e:  # noqa B036
-            LOG.debug("returning exception %s", e)
-            if future:
-                future.get_loop().call_soon_threadsafe(set_exception, future, e)
+        finally:
+            # Covers the cancelled-before-execution path; the success and
+            # exception paths release before forwarding their result.
+            if release_slot is not None:
+                release_slot()
 
 
 class Connection:
@@ -81,6 +103,13 @@ class Connection:
         connector: Callable[[], sqlite3.Connection],
         iter_chunk_size: int,
         loop: Optional[asyncio.AbstractEventLoop] = None,
+        *,
+        queue_size: Optional[int] = None,
+        max_queue_size: Optional[int] = None,
+        queue_limit: Optional[int] = None,
+        maxsize: Optional[int] = None,
+        max_pending: Optional[int] = None,
+        pending_limit: Optional[int] = None,
     ) -> None:
         self._running = True
         self._connection: Optional[sqlite3.Connection] = None
@@ -94,6 +123,40 @@ class Connection:
                 "aiosqlite.Connection no longer uses the `loop` parameter",
                 DeprecationWarning,
             )
+
+        limits = {
+            name: value
+            for name, value in (
+                ("queue_size", queue_size),
+                ("max_queue_size", max_queue_size),
+                ("queue_limit", queue_limit),
+                ("maxsize", maxsize),
+                ("max_pending", max_pending),
+                ("pending_limit", pending_limit),
+            )
+            if value is not None
+        }
+        if len(limits) > 1:
+            raise ValueError(
+                "queue_size, max_queue_size, queue_limit, maxsize, "
+                "max_pending, and pending_limit are aliases; pass at most one"
+            )
+        limit = next(iter(limits.values()), None)
+        if limit is not None:
+            if not isinstance(limit, int) or isinstance(limit, bool) or limit < 1:
+                raise ValueError("queue size limit must be a positive integer")
+        # Maximum number of operations that may be waiting in the transaction
+        # queue or executing on the worker thread at any time. None disables
+        # the limit (the default), preserving the previous unbounded behavior.
+        self._queue_limit: Optional[int] = limit
+        self._outstanding = 0
+        self._slots_lock = Lock()
+        self._slot_waiters: deque[list[Any]] = deque()
+
+    @property
+    def queue_size(self) -> Optional[int]:
+        """Maximum number of queued or executing operations, or None."""
+        return self._queue_limit
 
     def __del__(self):
         if self._connection is None:
@@ -113,6 +176,67 @@ class Connection:
         # be finalized by its own __del__.
         self.stop()
 
+    async def _acquire_slot(self) -> None:
+        """Reserve an outstanding-operation slot, waiting under backpressure."""
+        if self._queue_limit is None:
+            return
+
+        loop = asyncio.get_event_loop()
+        with self._slots_lock:
+            if self._outstanding < self._queue_limit:
+                self._outstanding += 1
+                return
+            entry: list[Any] = [loop.create_future(), False]
+            self._slot_waiters.append(entry)
+
+        try:
+            await entry[0]
+        except BaseException:
+            with self._slots_lock:
+                try:
+                    self._slot_waiters.remove(entry)
+                except ValueError:
+                    # The worker already popped and granted this waiter.
+                    pass
+                if entry[1]:
+                    # The worker handed us a slot, but the task was cancelled
+                    # before (or just as) it resumed; return the granted slot.
+                    self._release_slot_locked()
+            raise
+
+    def _release_slot_locked(self) -> None:
+        """Return a slot, handing it directly to the next waiter if any."""
+        self._outstanding -= 1
+        while self._slot_waiters:
+            entry = self._slot_waiters.popleft()
+            waiter = entry[0]
+            if waiter.done():
+                continue
+            try:
+                waiter.get_loop().call_soon_threadsafe(set_result, waiter, True)
+            except RuntimeError:
+                # The waiter's event loop is gone; skip it.
+                continue
+            entry[1] = True
+            self._outstanding += 1
+            return
+
+    def _release_slot(self) -> None:
+        if self._queue_limit is None:
+            return
+        with self._slots_lock:
+            self._release_slot_locked()
+
+    def _submit(
+        self, function: Callable[[], Any], release_slot: bool = False
+    ) -> asyncio.Future:
+        """Enqueue a function for the worker without applying backpressure."""
+        future = asyncio.get_event_loop().create_future()
+        self._tx.put_nowait(
+            (future, function, self._release_slot if release_slot else None)
+        )
+        return future
+
     def stop(self) -> Optional[asyncio.Future]:
         """Stop the background thread. Prefer `async with` or `await close()`"""
         self._running = False
@@ -128,7 +252,8 @@ class Connection:
         except Exception:
             future = None
 
-        self._tx.put_nowait((future, close_and_stop))
+        # Bypass backpressure: shutdown must never wait behind a full queue.
+        self._tx.put_nowait((future, close_and_stop, None))
         return future
 
     @property
@@ -153,9 +278,17 @@ class Connection:
             raise ValueError("Connection closed")
 
         function = partial(fn, *args, **kwargs)
-        future = asyncio.get_event_loop().create_future()
-
-        self._tx.put_nowait((future, function))
+        await self._acquire_slot()
+        if not self._running or not self._connection:
+            # Shutdown started while we waited for a slot; don't enqueue an
+            # operation that could be stranded behind the stop sentinel.
+            self._release_slot()
+            raise ValueError("Connection closed")
+        try:
+            future = self._submit(function, release_slot=self._queue_limit is not None)
+        except BaseException:
+            self._release_slot()
+            raise
 
         return await future
 
@@ -163,8 +296,7 @@ class Connection:
         """Connect to the actual sqlite database."""
         if self._connection is None:
             try:
-                future = asyncio.get_event_loop().create_future()
-                self._tx.put_nowait((future, self._connector))
+                future = self._submit(self._connector)
                 self._connection = await future
             except BaseException:
                 self.stop()
@@ -203,7 +335,10 @@ class Connection:
             return
 
         try:
-            await self._execute(self._conn.close)
+            # Bypass backpressure: close must not wait behind a full queue.
+            # Operations already accepted ahead of it still run to completion
+            # first, in queue order.
+            await self._submit(self._conn.close)
         except Exception:
             LOG.info("exception occurred while closing connection")
             raise
@@ -445,9 +580,24 @@ def connect(
     *,
     iter_chunk_size=64,
     loop: Optional[asyncio.AbstractEventLoop] = None,
+    queue_size: Optional[int] = None,
+    max_queue_size: Optional[int] = None,
+    queue_limit: Optional[int] = None,
+    maxsize: Optional[int] = None,
+    max_pending: Optional[int] = None,
+    pending_limit: Optional[int] = None,
     **kwargs: Any,
 ) -> Connection:
-    """Create and return a connection proxy to the sqlite database."""
+    """Create and return a connection proxy to the sqlite database.
+
+    ``queue_size`` optionally limits how many operations may be waiting in
+    the shared transaction queue or executing on the worker thread at once.
+    Once the limit is reached, producers wait asynchronously (backpressure)
+    instead of growing the queue without bound. The default ``None`` keeps
+    the queue unbounded. ``max_queue_size``, ``queue_limit``, ``maxsize``,
+    ``max_pending``, and ``pending_limit`` are accepted as aliases for
+    ``queue_size``.
+    """
 
     if loop is not None:
         warn(
@@ -465,4 +615,13 @@ def connect(
 
         return sqlite3.connect(loc, **kwargs)
 
-    return Connection(connector, iter_chunk_size)
+    return Connection(
+        connector,
+        iter_chunk_size,
+        queue_size=queue_size,
+        max_queue_size=max_queue_size,
+        queue_limit=queue_limit,
+        maxsize=maxsize,
+        max_pending=max_pending,
+        pending_limit=pending_limit,
+    )

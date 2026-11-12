@@ -7,12 +7,39 @@ import sys
 from pathlib import Path
 from sqlite3 import OperationalError
 from tempfile import TemporaryDirectory
-from threading import Thread
+from threading import Barrier, Thread
 from unittest import IsolatedAsyncioTestCase, SkipTest
 from unittest.mock import patch
 
 import aiosqlite
+import aiosqlite.core as core
 from .helpers import setup_logger
+
+
+class WorkerGate:
+    """Pin the connection worker at a barrier without blocking the event loop."""
+
+    def __init__(self):
+        self.loop = asyncio.get_running_loop()
+        self.started = asyncio.Event()
+        self.barrier = Barrier(2)
+
+    def block(self, result=None):
+        self.loop.call_soon_threadsafe(self.started.set)
+        self.barrier.wait()
+        return result
+
+    async def release(self):
+        await self.loop.run_in_executor(None, self.barrier.wait)
+
+    def abort(self):
+        self.barrier.abort()
+
+
+async def settle():
+    """Give all runnable producer tasks a chance to reach their await point."""
+    for _ in range(4):
+        await asyncio.sleep(0)
 
 
 class SmokeTest(IsolatedAsyncioTestCase):
@@ -535,3 +562,267 @@ class SmokeTest(IsolatedAsyncioTestCase):
         loop.close()
 
         db.stop()
+
+
+class QueueLimitTest(IsolatedAsyncioTestCase):
+    @classmethod
+    def setUpClass(cls):
+        setup_logger()
+
+    async def test_default_queue_is_unbounded(self):
+        db = await aiosqlite.connect(":memory:")
+        try:
+            self.assertIsNone(db._queue_limit)
+            self.assertIsNone(db.queue_size)
+        finally:
+            await db.close()
+
+    async def test_queue_limit_aliases(self):
+        for alias in (
+            "max_queue_size",
+            "queue_limit",
+            "maxsize",
+            "max_pending",
+            "pending_limit",
+        ):
+            db = await aiosqlite.connect(":memory:", **{alias: 4})
+            try:
+                self.assertEqual(db.queue_size, 4)
+            finally:
+                await db.close()
+
+    async def test_invalid_queue_limit(self):
+        with self.assertRaises(ValueError):
+            await aiosqlite.connect(":memory:", queue_size=0)
+        with self.assertRaises(ValueError):
+            await aiosqlite.connect(":memory:", max_queue_size=False)
+        with self.assertRaises(ValueError):
+            await aiosqlite.connect(":memory:", queue_size=1, max_queue_size=2)
+
+    async def test_limit_includes_executing_operation(self):
+        gate = WorkerGate()
+        db = await aiosqlite.connect(":memory:", queue_size=2)
+        tasks = []
+        try:
+            tasks.append(asyncio.create_task(db._execute(gate.block, "running")))
+            await gate.started.wait()
+
+            for value in range(4):
+                tasks.append(asyncio.create_task(db._execute(lambda v=value: v)))
+            await settle()
+
+            # One slot is the operation currently pinned on the worker;
+            # only one more item may actually be sitting in the queue.
+            self.assertEqual(db._outstanding, 2)
+            self.assertEqual(db._tx.qsize(), 1)
+            self.assertEqual(len(db._slot_waiters), 3)
+
+            await gate.release()
+            self.assertEqual(await asyncio.gather(*tasks), ["running", 0, 1, 2, 3])
+            await settle()
+            self.assertEqual(db._outstanding, 0)
+            self.assertEqual(db._tx.qsize(), 0)
+        finally:
+            gate.abort()
+            await asyncio.gather(*tasks, return_exceptions=True)
+            await db.close()
+
+        db._thread.join(timeout=1)
+        self.assertFalse(db._thread.is_alive())
+
+    async def test_cancel_while_waiting_to_enqueue(self):
+        gate = WorkerGate()
+        db = await aiosqlite.connect(":memory:", queue_size=1)
+        running = asyncio.create_task(db._execute(gate.block))
+        waiting = None
+        try:
+            await gate.started.wait()
+            waiting = asyncio.create_task(db._execute(lambda: "queued"))
+            await settle()
+            self.assertEqual(db._outstanding, 1)
+            self.assertEqual(len(db._slot_waiters), 1)
+
+            waiting.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await waiting
+            self.assertEqual(db._outstanding, 1)
+            self.assertEqual(len(db._slot_waiters), 0)
+
+            await gate.release()
+            self.assertIsNone(await running)
+            await settle()
+            self.assertEqual(db._outstanding, 0)
+            self.assertEqual(await db._execute(lambda: "next"), "next")
+        finally:
+            gate.abort()
+            if waiting is not None:
+                await asyncio.gather(waiting, running, return_exceptions=True)
+            else:
+                await running
+            await db.close()
+
+    async def test_cancel_while_waiting_in_queue(self):
+        gate = WorkerGate()
+        executed = set()
+        db = await aiosqlite.connect(":memory:", queue_size=2)
+        running = asyncio.create_task(db._execute(gate.block))
+        queued = None
+        try:
+            await gate.started.wait()
+            queued = asyncio.create_task(db._execute(lambda: executed.add("queued")))
+            await settle()
+            self.assertEqual(db._tx.qsize(), 1)
+
+            queued.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await queued
+            self.assertEqual(db._outstanding, 2)
+
+            await gate.release()
+            self.assertIsNone(await running)
+            await settle()
+            self.assertEqual(executed, set())
+            self.assertEqual(db._outstanding, 0)
+            self.assertEqual(db._tx.qsize(), 0)
+            self.assertEqual(await db._execute(lambda: "next"), "next")
+        finally:
+            gate.abort()
+            if queued is not None:
+                await asyncio.gather(queued, running, return_exceptions=True)
+            else:
+                await running
+            await db.close()
+
+    async def test_cancel_while_executing_keeps_slot_until_finished(self):
+        gate = WorkerGate()
+        db = await aiosqlite.connect(":memory:", queue_size=1)
+        running = asyncio.create_task(db._execute(gate.block))
+        try:
+            await gate.started.wait()
+            running.cancel()
+            with self.assertRaises(asyncio.CancelledError):
+                await running
+            self.assertEqual(db._outstanding, 1)
+
+            await gate.release()
+            await settle()
+            self.assertEqual(db._outstanding, 0)
+            self.assertEqual(await db._execute(lambda: "next"), "next")
+        finally:
+            gate.abort()
+            await asyncio.gather(running, return_exceptions=True)
+            await db.close()
+
+    async def test_slot_returns_when_completion_is_cancelled(self):
+        db = await aiosqlite.connect(":memory:", queue_size=1)
+        loop = asyncio.get_running_loop()
+        finished = asyncio.Event()
+
+        def operation():
+            loop.call_soon_threadsafe(finished.set)
+            return "done"
+
+        task = None
+        try:
+            with patch.object(core, "set_result", lambda future, result: None):
+                task = asyncio.create_task(db._execute(operation))
+                await finished.wait()
+                await settle()
+                self.assertEqual(db._outstanding, 0)
+
+                task.cancel()
+                with self.assertRaises(asyncio.CancelledError):
+                    await task
+            self.assertEqual(db._outstanding, 0)
+        finally:
+            if task is not None:
+                task.cancel()
+            await db.close()
+
+    async def test_cursor_methods_use_same_queue_entry(self):
+        first_gate = WorkerGate()
+        second_gate = WorkerGate()
+        db = await aiosqlite.connect(":memory:", queue_size=1)
+        first_pinned = asyncio.create_task(db._execute(first_gate.block))
+        cursor_task = None
+        second_pinned = None
+        fetchall_task = None
+        try:
+            await first_gate.started.wait()
+            cursor_task = asyncio.create_task(db.cursor())
+            await settle()
+            self.assertEqual(len(db._slot_waiters), 1)
+            await first_gate.release()
+            cursor = await cursor_task
+
+            second_pinned = asyncio.create_task(db._execute(second_gate.block))
+            await second_gate.started.wait()
+            fetchall_task = asyncio.create_task(cursor.fetchall())
+            await settle()
+            self.assertEqual(len(db._slot_waiters), 1)
+            await second_gate.release()
+            self.assertEqual(await fetchall_task, [])
+            await cursor.close()
+        finally:
+            first_gate.abort()
+            second_gate.abort()
+            await asyncio.gather(
+                first_pinned,
+                cursor_task,
+                second_pinned,
+                fetchall_task,
+                return_exceptions=True,
+            )
+            await db.close()
+
+    async def test_close_bypasses_a_full_queue(self):
+        gate = WorkerGate()
+        db = await aiosqlite.connect(":memory:", queue_size=2)
+        running = asyncio.create_task(db._execute(gate.block, "running"))
+        queued = None
+        closing = None
+        try:
+            await gate.started.wait()
+            queued = asyncio.create_task(db._execute(lambda: "queued"))
+            await settle()
+            self.assertEqual(db._outstanding, 2)
+
+            closing = asyncio.create_task(db.close())
+            await settle()
+            self.assertFalse(closing.done())
+
+            await gate.release()
+            self.assertEqual("running", await running)
+            self.assertEqual("queued", await queued)
+            await closing
+            self.assertEqual(db._tx.qsize(), 0)
+            db._thread.join(timeout=1)
+            self.assertFalse(db._thread.is_alive())
+        finally:
+            gate.abort()
+            await asyncio.gather(
+                running, *(t for t in (queued, closing) if t), return_exceptions=True
+            )
+            if db._thread.is_alive():
+                await db.close()
+
+    async def test_stop_bypasses_a_full_queue(self):
+        gate = WorkerGate()
+        db = await aiosqlite.connect(":memory:", queue_size=1)
+        running = asyncio.create_task(db._execute(gate.block))
+        try:
+            await gate.started.wait()
+            stop_future = db.stop()
+            await settle()
+            self.assertEqual(db._tx.qsize(), 1)
+
+            await gate.release()
+            self.assertIsNone(await running)
+            await stop_future
+            db._thread.join(timeout=1)
+            self.assertFalse(db._thread.is_alive())
+        finally:
+            gate.abort()
+            await asyncio.gather(running, return_exceptions=True)
+            if db._thread.is_alive():
+                db.stop()
