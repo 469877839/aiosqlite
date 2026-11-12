@@ -41,6 +41,37 @@ It can also be used in the traditional, procedural manner:
     await cursor.close()
     await db.close()
 
+Explicit transaction ownership
+------------------------------
+
+``db.transaction()`` gives the current task exclusive ownership of the
+connection's transaction.  Other tasks sharing the connection wait until the
+owning context exits instead of silently joining the same transaction:
+
+.. code-block:: python
+
+    async with aiosqlite.connect(...) as db:
+        async def other_task():
+            async with db.transaction():      # waits for the owner to finish
+                await db.execute("INSERT INTO foo ...")
+
+        async with db.transaction():          # owned by this task
+            await db.execute("INSERT INTO foo ...")
+            # commit on success, rollback on exception
+
+The owner may keep using the connection and its cursors as usual.  A child
+task that merely inherits the ownership ``ContextVar`` (for example one
+created inside the context) does not gain ownership and gets an
+``aiosqlite.TransactionError`` when it touches the connection.  Nested
+transaction contexts in the same task are rejected, as are hand-written
+transaction control statements (``BEGIN``, ``COMMIT``, ``ROLLBACK``,
+``SAVEPOINT``, ...) while an explicit transaction is active; ``executescript``
+is refused because it would implicitly commit the owned transaction.  All of
+these checks happen before anything runs on the connection.
+
+Outside an explicit transaction, ``commit()`` and ``rollback()`` keep their
+original connection-level meaning.
+
 aiosqlite also replicates most of the advanced features of ``sqlite3``:
 
 .. code-block:: python

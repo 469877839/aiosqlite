@@ -5,6 +5,8 @@ import sqlite3
 from collections.abc import AsyncIterator, Iterable
 from typing import Any, Callable, Optional, TYPE_CHECKING
 
+from .transaction import TransactionError
+
 if TYPE_CHECKING:
     from .core import Connection
 
@@ -35,6 +37,7 @@ class Cursor:
         self, sql: str, parameters: Optional[Iterable[Any]] = None
     ) -> "Cursor":
         """Execute the given query."""
+        self._conn._reject_transaction_control(sql)
         if parameters is None:
             parameters = []
         await self._execute(self._cursor.execute, sql, parameters)
@@ -44,11 +47,17 @@ class Cursor:
         self, sql: str, parameters: Iterable[Iterable[Any]]
     ) -> "Cursor":
         """Execute the given multiquery."""
+        self._conn._reject_transaction_control(sql)
         await self._execute(self._cursor.executemany, sql, parameters)
         return self
 
     async def executescript(self, sql_script: str) -> "Cursor":
         """Execute a user script."""
+        if self._conn._transaction is not None:
+            raise TransactionError(
+                "executescript() is not allowed while an explicit transaction "
+                "is active; it would implicitly commit the owned transaction"
+            )
         await self._execute(self._cursor.executescript, sql_script)
         return self
 

@@ -6,7 +6,9 @@ Core implementation of aiosqlite proxies
 """
 
 import asyncio
+import contextvars
 import logging
+import re
 import sqlite3
 from collections.abc import AsyncIterator, Generator, Iterable
 from functools import partial
@@ -18,8 +20,9 @@ from warnings import warn
 
 from .context import contextmanager
 from .cursor import Cursor
+from .transaction import _TRANSACTION_OWNER, Transaction, TransactionError
 
-__all__ = ["connect", "Connection", "Cursor"]
+__all__ = ["connect", "Connection", "Cursor", "Transaction", "TransactionError"]
 
 AuthorizerCallback = Callable[[int, str, str, str, str], int]
 
@@ -27,6 +30,22 @@ LOG = logging.getLogger("aiosqlite")
 
 
 IsolationLevel = Optional[Literal["DEFERRED", "IMMEDIATE", "EXCLUSIVE"]]
+
+# Transaction control statements that must not be mixed into an explicit
+# transaction through the legacy connection-level API.
+_TRANSACTION_CONTROL = re.compile(
+    r"^\s*(?:--[^\n]*\n|/\*.*?\*/\s*)*"
+    r"(begin|commit|end|rollback|savepoint|release)\b",
+    re.IGNORECASE | re.DOTALL,
+)
+
+
+def _check_transaction_control(sql: str) -> None:
+    if _TRANSACTION_CONTROL.match(sql):
+        raise TransactionError(
+            "transaction control statements are not allowed while an explicit "
+            "transaction is active on this connection"
+        )
 
 
 def set_result(fut: asyncio.Future, result: Any) -> None:
@@ -88,6 +107,11 @@ class Connection:
         self._tx: _TxQueue = SimpleQueue()
         self._iter_chunk_size = iter_chunk_size
         self._thread = Thread(target=_connection_worker_thread, args=(self._tx,))
+        self._transaction: Optional[Transaction] = None
+        self._transaction_waiters: list[asyncio.Future] = []
+        self._transaction_token: Optional[
+            contextvars.Token[Optional[Transaction]]
+        ] = None
 
         if loop is not None:
             warn(
@@ -147,10 +171,13 @@ class Connection:
         cursor = self._conn.execute(sql, parameters)
         return cursor.fetchall()
 
-    async def _execute(self, fn, *args, **kwargs):
+    async def _execute(self, fn, *args, _bypass_transaction: bool = False, **kwargs):
         """Queue a function with the given arguments for execution."""
         if not self._running or not self._connection:
             raise ValueError("Connection closed")
+
+        if not _bypass_transaction:
+            await self._wait_for_transaction()
 
         function = partial(fn, *args, **kwargs)
         future = asyncio.get_event_loop().create_future()
@@ -158,6 +185,73 @@ class Connection:
         self._tx.put_nowait((future, function))
 
         return await future
+
+    # -- explicit transaction ownership -----------------------------------
+
+    def _current_transaction(self) -> Optional[Transaction]:
+        return self._transaction
+
+    def _begin_transaction(self, transaction: Transaction) -> None:
+        self._transaction = transaction
+        self._transaction_token = _TRANSACTION_OWNER.set(transaction)
+
+    def _end_transaction(self, transaction: Transaction) -> None:
+        if self._transaction is not transaction:
+            return
+
+        self._transaction = None
+        if self._transaction_token is not None:
+            try:
+                _TRANSACTION_OWNER.reset(self._transaction_token)
+            except (RuntimeError, ValueError):
+                # The token belongs to a different context; nothing to undo
+                # there, and ownership is already released above.
+                pass
+            self._transaction_token = None
+
+        waiters = self._transaction_waiters
+        self._transaction_waiters = []
+        for waiter in waiters:
+            if not waiter.done():
+                waiter.set_result(None)
+
+    async def _wait_for_transaction(self) -> None:
+        transaction = self._transaction
+        if transaction is None:
+            return
+
+        if transaction._owner_task is asyncio.current_task():
+            return
+
+        if _TRANSACTION_OWNER.get() is transaction:
+            # The ContextVar was inherited by a child task (``asyncio.gather``
+            # and friends copy the current context). Inheritance is not
+            # ownership: only the task that entered the context may use the
+            # connection while the transaction is active.
+            raise TransactionError(
+                "only the task that entered the transaction context may use "
+                "the connection while it owns the transaction"
+            )
+
+        waiter = asyncio.get_running_loop().create_future()
+        self._transaction_waiters.append(waiter)
+        try:
+            await waiter
+        except asyncio.CancelledError:
+            if waiter in self._transaction_waiters:
+                self._transaction_waiters.remove(waiter)
+            raise
+
+    def transaction(self) -> Transaction:
+        """
+        Start an explicit transaction owned by the current task.
+
+        Connection and cursor operations from other tasks wait until the
+        context exits (commit on success, roll back on exception). Nested
+        contexts and hand-written transaction control statements are rejected
+        before any side effects occur.
+        """
+        return Transaction(self)
 
     async def _connect(self) -> "Connection":
         """Connect to the actual sqlite database."""
@@ -196,14 +290,24 @@ class Connection:
         """Roll back the current transaction."""
         await self._execute(self._conn.rollback)
 
+    def _reject_transaction_control(self, sql: str) -> None:
+        if self._transaction is not None:
+            _check_transaction_control(sql)
+
     async def close(self) -> None:
         """Complete queued queries/cursors and close the connection."""
 
         if self._connection is None:
             return
 
+        waiters = self._transaction_waiters
+        self._transaction_waiters = []
+        for waiter in waiters:
+            if not waiter.done():
+                waiter.cancel()
+
         try:
-            await self._execute(self._conn.close)
+            await self._execute(self._conn.close, _bypass_transaction=True)
         except Exception:
             LOG.info("exception occurred while closing connection")
             raise
@@ -218,6 +322,7 @@ class Connection:
         self, sql: str, parameters: Optional[Iterable[Any]] = None
     ) -> Cursor:
         """Helper to create a cursor and execute the given query."""
+        self._reject_transaction_control(sql)
         if parameters is None:
             parameters = []
         cursor = await self._execute(self._conn.execute, sql, parameters)
@@ -228,6 +333,7 @@ class Connection:
         self, sql: str, parameters: Optional[Iterable[Any]] = None
     ) -> Optional[sqlite3.Row]:
         """Helper to insert and get the last_insert_rowid."""
+        self._reject_transaction_control(sql)
         if parameters is None:
             parameters = []
         return await self._execute(self._execute_insert, sql, parameters)
@@ -237,6 +343,7 @@ class Connection:
         self, sql: str, parameters: Optional[Iterable[Any]] = None
     ) -> Iterable[sqlite3.Row]:
         """Helper to execute a query and return all the data."""
+        self._reject_transaction_control(sql)
         if parameters is None:
             parameters = []
         return await self._execute(self._execute_fetchall, sql, parameters)
@@ -246,12 +353,18 @@ class Connection:
         self, sql: str, parameters: Iterable[Iterable[Any]]
     ) -> Cursor:
         """Helper to create a cursor and execute the given multiquery."""
+        self._reject_transaction_control(sql)
         cursor = await self._execute(self._conn.executemany, sql, parameters)
         return Cursor(self, cursor)
 
     @contextmanager
     async def executescript(self, sql_script: str) -> Cursor:
         """Helper to create a cursor and execute a user script."""
+        if self._transaction is not None:
+            raise TransactionError(
+                "executescript() is not allowed while an explicit transaction "
+                "is active; it would implicitly commit the owned transaction"
+            )
         cursor = await self._execute(self._conn.executescript, sql_script)
         return Cursor(self, cursor)
 

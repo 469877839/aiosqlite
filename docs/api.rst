@@ -12,6 +12,14 @@ Connection
 .. autoclass:: Connection
     :special-members: __aenter__, __aexit__, __await__
 
+Transactions
+------------
+
+.. autoclass:: Transaction
+    :members:
+
+.. autoexception:: TransactionError
+
 Cursors
 -------
 
