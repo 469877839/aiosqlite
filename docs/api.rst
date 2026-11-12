@@ -18,6 +18,17 @@ Cursors
 .. autoclass:: aiosqlite.cursor.Cursor
     :special-members: __aiter__, __anext__, __aenter__, __aexit__
 
+Cancellation
+------------
+
+.. autoclass:: CancellationPolicy
+    :members:
+
+.. autoclass:: OperationCancelledError
+
+.. autoclass:: CancellationInfo
+    :members:
+
 Errors
 ------
 

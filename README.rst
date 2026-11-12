@@ -81,6 +81,51 @@ connections.  Cursors are similarly proxies to the real cursors, and provide
 async iterators to query results.
 
 
+Cancellation
+------------
+
+Plain ``await db.execute(...)`` keeps the traditional AsyncIO semantics: cancelling
+the await raises ``CancelledError`` but does not tell the worker thread anything,
+so the SQL may still be queued or still running.  Use the explicit cancellable
+helpers when the caller needs to know what happened to the database:
+
+.. code-block:: python
+
+    from aiosqlite import CancellationPolicy, OperationCancelledError
+
+    try:
+        async with db.execute_cancellable(
+            "INSERT INTO some_table ...",
+            policy=CancellationPolicy.INTERRUPT,
+        ):
+            ...
+    except OperationCancelledError as exc:
+        print(exc.info.phase)  # queued, running, interrupted, or completed
+
+``policy=CancellationPolicy.NEVER`` (the default) never interrupts the worker:
+queued operations are dropped before they run, and an operation that already
+started runs to completion.  ``CancellationPolicy.INTERRUPT`` additionally
+interrupts the *one* operation the caller owns when it is already executing.
+The interrupt is correlated with that operation's queue state and execution
+phase, and is withheld once that operation has finished, so it cannot spill
+over into the next caller's statement.
+
+``exc.info.phase`` describes the database side effects:
+
+- ``queued``: the operation never ran; there are no side effects.
+- ``running``: cancellation was requested under ``NEVER`` while the statement
+  was executing; it ran to completion and its effects stand.
+- ``interrupted``: the statement was aborted.  SQLite rolls back the current
+  *statement* only; the surrounding connection transaction, earlier statements
+  in that transaction, and previously committed writes are untouched.
+- ``completed``: the operation finished before cancellation won the race; its
+  effects stand and only the result is discarded.
+
+Cancellation never automatically rolls back the whole connection transaction.
+If a cancelled write must be undone, decide that explicitly with
+``await db.rollback()`` (or ``commit`` the work that should be kept).
+
+
 License
 -------
 
